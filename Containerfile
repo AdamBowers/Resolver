@@ -43,7 +43,7 @@ ENV GOOS=linux
 RUN go build -trimpath -ldflags="-s -w" -o /out/coredns .
 
 # Fetch current IANA root hints for iterative root recursion
-ADD https://internic.net /out/root.hints
+ADD https://www.internic.net/domain/named.root /out/root.hints
 
 # ==============================================================================
 # Stage 2: Minimal Hardened Alpine Runtime (ReadOnly=true Quadlet Ready)
