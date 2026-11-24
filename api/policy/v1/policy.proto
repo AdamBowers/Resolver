@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package dnsresolver.policy.v1;
+
+option go_package = "://github.com";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// Cryptographic Keyring & Hybrid Post-Quantum Signatures
+// ============================================================================
+
+// SignatureAlgorithm identifies the cryptographic signature scheme used to sign
+// or verify a policy stream footer.
+enum SignatureAlgorithm {
+  // Default unset value; always rejected during keyring and signature validation.
+  SIGNATURE_ALGORITHM_UNSPECIFIED = 0;
+
+  // Classical Ed25519 (RFC 8032) signature (32-byte public key, 64-byte signature).
+  SIGNATURE_ALGORITHM_ED25519 = 1;
+
+  // NIST FIPS 204 ML-DSA-65 post-quantum lattice signature (1,952-byte public key, 3,309-byte signature).
+  SIGNATURE_ALGORITHM_ML_DSA_65 = 2;
+
+  // NIST FIPS 204 ML-DSA-87 post-quantum lattice signature (2,592-byte public key, 4,627-byte signature).
+  SIGNATURE_ALGORITHM_ML_DSA_87 = 3;
+}
+
+// TrustedKey represents a single verification public key in CoreDNS's keyring.
+// Multiple keys can be active concurrently to support zero-downtime key rotation.
+message TrustedKey {
+  // Unique identifier used to match a PolicyFooter Signature to this public key
+  // (e.g., "prod-2026-11-ed25519", "prod-2026-11-mldsa65").
+  string key_id = 1;
+
+  // Cryptographic algorithm that this public key must be used with.
+  SignatureAlgorithm algorithm = 2;
+
+  // Raw public key bytes encoded according to the specified algorithm.
+  bytes public_key = 3;
+
+  // Optional activation timestamp; signatures made before this time (minus clock skew) are rejected.
+  google.protobuf.Timestamp not_before = 4;
+
+  // Optional expiration timestamp; signatures verified after this time (plus clock skew/grace) are rejected.
+  google.protobuf.Timestamp expires_at = 5;
+
+  // Emergency kill-switch; if true, this key is immediately rejected regardless of expires_at.
+  bool revoked = 6;
+}
+
+// TrustedKeyring is serialized to disk and mounted read-only into CoreDNS
+// (e.g., /etc/coredns/keys/trusted-keyring.pb).
+message TrustedKeyring {
+  // Structural version of the keyring file format (currently 1).
+  uint32 keyring_version = 1;
+
+  // Complete set of trusted classical and post-quantum public keys.
+  repeated TrustedKey keys = 2;
+}
+
+// Signature holds a single cryptographic signature over the PolicyFooter signing input.
+message Signature {
+  // Identifier of the TrustedKey in TrustedKeyring that must verify this signature.
+  string key_id = 1;
+
+  // Algorithm used to produce this signature; must match the referenced TrustedKey.algorithm.
+  SignatureAlgorithm algorithm = 2;
+
+  // Raw signature bytes produced over the canonical PolicyFooter signing payload.
+  bytes signature = 3;
+}
+
+// ============================================================================
+// Streaming Policy Bundle (Length-Delimited via protodelim)
+// ============================================================================
+//
+// Disk wire format (/etc/coredns/policies/policy.pb):
+//   - An existing 0-byte file represents a valid empty pass-through policy (no rules).
+//   - A non-empty file is a stream of varint length-delimited PolicyFrame messages:
+//       Frame 1:       PolicyFrame { header: PolicyHeader }
+//       Frames 2..N-1: PolicyFrame { chunk:  PolicyChunk  } (sequence = 1..total_chunks)
+//       Frame N:       PolicyFrame { footer: PolicyFooter }
+
+// PolicyFrame is the union wrapper written as varint length-delimited records on disk.
+message PolicyFrame {
+  oneof frame {
+    // Metadata and contract version frame; must appear exactly once as Frame 1.
+    PolicyHeader header = 1;
+
+    // Incremental batch of blocklist rules; zero or more frames appearing between header and footer.
+    PolicyChunk chunk = 2;
+
+    // Integrity digest and hybrid PQC signatures; must appear exactly once as the final frame.
+    PolicyFooter footer = 3;
+  }
+}
+
+// PolicyHeader carries stream metadata validated before CoreDNS processes any rule chunks.
+message PolicyHeader {
+  // Semantic contract version of the policy stream (currently 1).
+  // CoreDNS rejects streams outside [min_policy_schema, max_policy_schema].
+  uint32 schema_version = 1;
+
+  // Monotonic policy rule revision number; increments ONLY when the underlying blocklist
+  // rules change. Invariant across every CoreDNS instance serving the same profile.
+  uint64 policy_revision = 2;
+
+  // UTC timestamp recording when this policy_revision was compiled by the Controller.
+  google.protobuf.Timestamp policy_created_at = 3;
+
+  // Monotonic envelope signing sequence; increments on EVERY bundle generation, including
+  // both rule changes and key-rotation re-signs of an unchanged policy_revision.
+  // Enforced against rollback (incoming bundle_sequence must be >= active bundle_sequence).
+  uint64 bundle_sequence = 4;
+
+  // UTC timestamp recording when this specific bundle envelope was signed.
+  google.protobuf.Timestamp bundle_signed_at = 5;
+}
+
+// PolicyChunk carries a small batch (~250 rules / ~16 KiB) of blocklist rules so CoreDNS
+// can stream tens of megabytes from disk with bounded memory and 0.5% CPU duty pacing.
+message PolicyChunk {
+  // Strictly sequential 1-based chunk index (1, 2, ..., total_chunks) to detect dropped or reordered frames.
+  uint64 sequence = 1;
+
+  // Pre-normalized domain names or wildcard patterns to block pre-resolution
+  // (e.g., "malware.example", "*.phishing.example").
+  repeated string blocked_domains = 2;
+
+  // Pre-validated binary IPv4/IPv6 CIDR prefixes to block post-resolution on A/AAAA answers.
+  repeated CIDRPrefix blocked_ips = 3;
+}
+
+// CIDRPrefix represents a compact binary IPv4 or IPv6 network prefix.
+message CIDRPrefix {
+  // Network-order IP address bytes: exactly 4 bytes for IPv4 or 16 bytes for IPv6.
+  bytes addr = 1;
+
+  // Network mask length: 0..32 for IPv4 or 0..128 for IPv6.
+  uint32 prefix_len = 2;
+}
+
+// PolicyFooter closes the policy stream and commits cryptographically to every preceding frame.
+message PolicyFooter {
+  // Exact count of PolicyChunk frames preceding this footer; must match the number of chunks read.
+  uint64 total_chunks = 1;
+
+  // 32-byte SHA-256 digest computed over all raw varint-delimited bytes from Frame 1 (PolicyHeader)
+  // through Frame N-1 (the final PolicyChunk).
+  bytes stream_sha256 = 2;
+
+  // Cryptographic signatures over ("dnsresolver.policy.v1.PolicyFooter" || 0x00 || uint64be(total_chunks) || stream_sha256).
+  // When hybrid mode is enabled, must include >=1 valid classical signature AND >=1 valid PQC signature.
+  repeated Signature signatures = 3;
+}

@@ -7,16 +7,26 @@ import (
 	"time"
 )
 
-// PolicySnapshot is an immutable, point-in-time bundle of compiled allowlist
-// and denylist trees swapped atomically via atomic.Pointer.
+// PolicySnapshot is an immutable, lock-free read-only snapshot of active blocklist rules
+// and stream metadata, swapped atomically via atomic.Pointer[PolicySnapshot].
 type PolicySnapshot struct {
-	Domains      *DomainTree
-	BlockedIPs   *IPRadixTree
-	DomainCount  int
-	CIDRCount    int
-	DomainSHA256 string
-	CIDRSHA256   string
-	LoadedAt     time.Time
+	// BlockedDomains holds pre-resolution blocked domain names and wildcard suffixes.
+	// Nil when no domain blocklist rules are active (pass-through).
+	BlockedDomains *DomainTree
+
+	// BlockedIPs holds post-resolution blocked IPv4/IPv6 CIDR prefixes.
+	// Nil when no IP/CIDR blocklist rules are active (pass-through).
+	BlockedIPs *IPRadixTree
+
+	BlockedDomainCount uint64
+	BlockedCIDRCount   uint64
+
+	PolicyRevision  uint64
+	PolicyCreatedAt time.Time
+	BundleSequence  uint64
+	BundleSignedAt  time.Time
+	BundleSHA256    string
+	LoadedAt        time.Time
 }
 
 // =============================================================================
